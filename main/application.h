@@ -143,6 +143,11 @@ private:
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 
+    // Voice interrupt protection (防止 VAD 误触发打断)
+    int64_t speaking_start_time_ = 0;           // AI 开始说话的时间
+    int64_t voice_detected_start_time_ = 0;     // 检测到用户声音的起始时间
+    bool voice_interrupt_pending_ = false;       // 是否有待处理的打断
+
 
     // Event handlers
     void HandleStateChangedEvent();

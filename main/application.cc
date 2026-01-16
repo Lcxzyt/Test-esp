@@ -216,10 +216,18 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
+            // 在 Speaking 状态且是实时模式时，暂停发送音频给服务器
+            // 这样可以避免回声被服务器 ASR 误识别
+            // 打断由设备端 VAD 控制
+            auto current_state = GetDeviceState();
+            bool should_send = !(current_state == kDeviceStateSpeaking && 
+                                 listening_mode_ == kListeningModeRealtime);
+            
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
-                if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
+                if (should_send && protocol_ && !protocol_->SendAudio(std::move(packet))) {
                     break;
                 }
+                // 如果不发送，packet 会在作用域结束时被释放
             }
         }
 
@@ -228,9 +236,35 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_VAD_CHANGE) {
-            if (GetDeviceState() == kDeviceStateListening) {
+            auto state = GetDeviceState();
+            if (state == kDeviceStateListening) {
                 auto led = Board::GetInstance().GetLed();
                 led->OnStateChanged();
+            } else if (state == kDeviceStateSpeaking && listening_mode_ == kListeningModeRealtime) {
+                // 在实时模式下，由设备端 VAD 控制语音打断
+                // VAD 事件只在状态变化时触发（开始说话/停止说话）
+                // 防抖动保护：AI 说话一段时间后才允许被打断
+                
+                const int64_t SPEAKING_PROTECTION_MS = 1000;   // AI 说话保护期（1秒）
+                
+                int64_t now = esp_timer_get_time() / 1000;  // 转换为毫秒
+                int64_t speaking_duration = now - speaking_start_time_;
+                
+                if (audio_service_.IsVoiceDetected()) {
+                    // VAD 检测到用户开始说话
+                    ESP_LOGI(TAG, "Voice detected during speaking (AI speaking for %lldms)", speaking_duration);
+                    
+                    // 检查是否满足打断条件（AI 说话超过保护期）
+                    if (speaking_duration > SPEAKING_PROTECTION_MS) {
+                        ESP_LOGI(TAG, ">>> Voice interrupt triggered!");
+                        AbortSpeaking(kAbortReasonNone);
+                    } else {
+                        ESP_LOGI(TAG, "Voice ignored (still in protection period)");
+                    }
+                } else {
+                    // VAD 检测到用户停止说话
+                    ESP_LOGD(TAG, "Voice stopped during speaking");
+                }
             }
         }
 
@@ -835,6 +869,10 @@ void Application::HandleStateChangedEvent() {
             break;
         case kDeviceStateSpeaking:
             display->SetStatus(Lang::Strings::SPEAKING);
+
+            // 记录 AI 开始说话的时间，用于语音打断保护
+            speaking_start_time_ = esp_timer_get_time() / 1000;
+            voice_detected_start_time_ = 0;  // 重置用户声音检测计时
 
             if (listening_mode_ != kListeningModeRealtime) {
                 audio_service_.EnableVoiceProcessing(false);
