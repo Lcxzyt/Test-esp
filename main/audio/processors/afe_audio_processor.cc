@@ -57,8 +57,12 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
 
 #ifdef CONFIG_USE_DEVICE_AEC
+    // 软件回采模式：同时启用 AEC 和 VAD
+    // AEC 用于消除回声，VAD 用于检测用户是否在说话
+    // 两者必须同时工作才能实现"回声消除+语音打断"
     afe_config->aec_init = true;
-    afe_config->vad_init = false;
+    afe_config->vad_init = true;  // 必须启用 VAD！
+    ESP_LOGI(TAG, "Device AEC mode: AEC=true, VAD=true");
 #else
     afe_config->aec_init = false;
     afe_config->vad_init = true;
@@ -175,8 +179,11 @@ void AfeAudioProcessor::AudioProcessorTask() {
 void AfeAudioProcessor::EnableDeviceAec(bool enable) {
     if (enable) {
 #if CONFIG_USE_DEVICE_AEC
-        afe_iface_->disable_vad(afe_data_);
+        // 软件回采模式：同时启用 AEC 和 VAD
+        // 不要禁用 VAD，否则无法检测用户说话
         afe_iface_->enable_aec(afe_data_);
+        afe_iface_->enable_vad(afe_data_);  // 保持 VAD 启用
+        ESP_LOGI(TAG, "Device AEC enabled, VAD kept enabled");
 #else
         ESP_LOGE(TAG, "Device AEC is not supported");
 #endif

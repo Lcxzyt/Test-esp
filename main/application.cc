@@ -242,28 +242,40 @@ void Application::Run() {
                 led->OnStateChanged();
             } else if (state == kDeviceStateSpeaking && listening_mode_ == kListeningModeRealtime) {
                 // 在实时模式下，由设备端 VAD 控制语音打断
-                // VAD 事件只在状态变化时触发（开始说话/停止说话）
-                // 防抖动保护：AI 说话一段时间后才允许被打断
+                // 使用两层保护机制：
+                // 1. AI 说话保护期：给 AEC 时间收敛
+                // 2. 语音持续检测：过滤瞬时回声
                 
-                const int64_t SPEAKING_PROTECTION_MS = 1000;   // AI 说话保护期（1秒）
+                const int64_t SPEAKING_PROTECTION_MS = 1500;  // AI 说话保护期（1.5秒）
+                const int64_t VOICE_SUSTAIN_MS = 300;         // 语音持续检测（300ms）
                 
                 int64_t now = esp_timer_get_time() / 1000;  // 转换为毫秒
                 int64_t speaking_duration = now - speaking_start_time_;
                 
                 if (audio_service_.IsVoiceDetected()) {
-                    // VAD 检测到用户开始说话
-                    ESP_LOGI(TAG, "Voice detected during speaking (AI speaking for %lldms)", speaking_duration);
-                    
-                    // 检查是否满足打断条件（AI 说话超过保护期）
-                    if (speaking_duration > SPEAKING_PROTECTION_MS) {
-                        ESP_LOGI(TAG, ">>> Voice interrupt triggered!");
-                        AbortSpeaking(kAbortReasonNone);
-                    } else {
-                        ESP_LOGI(TAG, "Voice ignored (still in protection period)");
+                    // VAD 检测到声音开始
+                    if (voice_detected_start_time_ == 0) {
+                        // 第一次检测到，记录开始时间
+                        voice_detected_start_time_ = now;
+                        ESP_LOGI(TAG, "Voice started during speaking (AI speaking for %d ms)", (int)speaking_duration);
                     }
+                    // 注意：VAD_CHANGE 只在状态变化时触发，声音持续期间不会触发
+                    // 所以持续检测逻辑移到 CLOCK_TICK 中
                 } else {
-                    // VAD 检测到用户停止说话
-                    ESP_LOGD(TAG, "Voice stopped during speaking");
+                    // VAD 检测到声音结束
+                    if (voice_detected_start_time_ > 0) {
+                        int64_t voice_duration = now - voice_detected_start_time_;
+                        ESP_LOGI(TAG, "Voice ended after %d ms (AI speaking for %d ms)", 
+                                 (int)voice_duration, (int)speaking_duration);
+                        
+                        // 在声音结束时也检查打断条件（针对用户短暂说话后停顿的情况）
+                        if (speaking_duration > SPEAKING_PROTECTION_MS && voice_duration > VOICE_SUSTAIN_MS) {
+                            ESP_LOGI(TAG, ">>> Voice interrupt triggered on voice end! (AI: %d ms, Voice: %d ms)", 
+                                     (int)speaking_duration, (int)voice_duration);
+                            AbortSpeaking(kAbortReasonNone);
+                        }
+                        voice_detected_start_time_ = 0;  // 重置
+                    }
                 }
             }
         }
@@ -285,6 +297,30 @@ void Application::Run() {
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
                 SystemInfo::PrintHeapStats();
+            }
+            
+            // 持续声音检测：在 Speaking 状态下检查是否有持续的用户声音
+            // 这是为了补充 VAD_CHANGE 事件（它只在状态变化时触发）
+            auto state = GetDeviceState();
+            if (state == kDeviceStateSpeaking && listening_mode_ == kListeningModeRealtime) {
+                const int64_t SPEAKING_PROTECTION_MS = 1500;  // AI 说话保护期
+                const int64_t VOICE_SUSTAIN_MS = 300;         // 语音持续检测
+                
+                int64_t now = esp_timer_get_time() / 1000;
+                int64_t speaking_duration = now - speaking_start_time_;
+                
+                // 检查是否有持续的声音
+                if (voice_detected_start_time_ > 0 && audio_service_.IsVoiceDetected()) {
+                    int64_t voice_duration = now - voice_detected_start_time_;
+                    
+                    // 两个条件都满足才打断
+                    if (speaking_duration > SPEAKING_PROTECTION_MS && voice_duration > VOICE_SUSTAIN_MS) {
+                        ESP_LOGI(TAG, ">>> Voice interrupt triggered on sustained voice! (AI: %d ms, Voice: %d ms)", 
+                                 (int)speaking_duration, (int)voice_duration);
+                        AbortSpeaking(kAbortReasonNone);
+                        voice_detected_start_time_ = 0;
+                    }
+                }
             }
         }
     }

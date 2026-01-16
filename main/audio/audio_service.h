@@ -183,6 +183,33 @@ private:
     std::chrono::steady_clock::time_point last_input_time_;
     std::chrono::steady_clock::time_point last_output_time_;
 
+#ifdef CONFIG_USE_DEVICE_AEC
+    // 软件回采缓冲区 - 用于存储输出到扬声器的音频数据作为 AEC 参考信号
+    // AFE AEC 要求参考信号必须是 16kHz
+    static constexpr size_t SOFTWARE_REF_BUFFER_SIZE = 16000 * 2;  // 2秒 @ 16kHz
+    static constexpr int SOFTWARE_REF_SAMPLE_RATE = 16000;         // AEC 参考信号固定采样率
+    std::vector<int16_t> software_ref_buffer_;
+    size_t software_ref_write_pos_ = 0;
+    size_t software_ref_read_pos_ = 0;
+    std::mutex software_ref_mutex_;
+    
+    // 用于将非 16kHz 的播放音频降采样到 16kHz
+    esp_ae_rate_cvt_handle_t software_ref_resampler_ = nullptr;
+    int software_ref_resampler_src_rate_ = 0;
+    std::mutex software_ref_resampler_mutex_;
+    
+    // 调试统计
+    uint32_t software_ref_underrun_count_ = 0;  // 欠载次数
+    uint32_t software_ref_overrun_count_ = 0;   // 溢出次数
+    
+    // 将输出音频写入软件参考缓冲区（会自动重采样到 16kHz）
+    void WriteSoftwareReference(const std::vector<int16_t>& data, int sample_rate);
+    // 从软件参考缓冲区读取参考数据
+    void ReadSoftwareReference(std::vector<int16_t>& ref_data, size_t samples);
+    // 将麦克风数据和参考数据交织
+    void InterleaveWithReference(std::vector<int16_t>& mic_data);
+#endif
+
     void AudioInputTask();
     void AudioOutputTask();
     void OpusCodecTask();

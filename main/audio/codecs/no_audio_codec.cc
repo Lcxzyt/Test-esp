@@ -20,6 +20,14 @@ NoAudioCodecDuplex::NoAudioCodecDuplex(int input_sample_rate, int output_sample_
     input_sample_rate_ = input_sample_rate;
     output_sample_rate_ = output_sample_rate;
 
+#ifdef CONFIG_USE_DEVICE_AEC
+    // 软件回采模式：告诉系统我们有参考信号
+    // 实际的参考信号将由软件层在 AudioService 中提供
+    input_reference_ = true;
+    input_channels_ = 2;  // 麦克风通道 + 参考通道
+    ESP_LOGI(TAG, "Software AEC enabled: input_reference=true, input_channels=2");
+#endif
+
     i2s_chan_config_t chan_cfg = {
         .id = I2S_NUM_0,
         .role = I2S_ROLE_MASTER,
@@ -79,6 +87,13 @@ NoAudioCodecSimplex::NoAudioCodecSimplex(int input_sample_rate, int output_sampl
     duplex_ = false;
     input_sample_rate_ = input_sample_rate;
     output_sample_rate_ = output_sample_rate;
+
+#ifdef CONFIG_USE_DEVICE_AEC
+    // 软件回采模式：告诉系统我们有参考信号
+    input_reference_ = true;
+    input_channels_ = 2;  // 麦克风通道 + 参考通道
+    ESP_LOGI(TAG, "Software AEC enabled: input_reference=true, input_channels=2");
+#endif
 
     // Create a new channel for speaker
     i2s_chan_config_t chan_cfg = {

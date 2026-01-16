@@ -57,11 +57,24 @@ AudioService::~AudioService() {
     if (output_resampler_ != nullptr) {
         esp_ae_rate_cvt_close(output_resampler_);
     }
+#ifdef CONFIG_USE_DEVICE_AEC
+    if (software_ref_resampler_ != nullptr) {
+        esp_ae_rate_cvt_close(software_ref_resampler_);
+    }
+#endif
 }
 
 void AudioService::Initialize(AudioCodec* codec) {
     codec_ = codec;
     codec_->Start();
+
+#ifdef CONFIG_USE_DEVICE_AEC
+    // 初始化软件回采缓冲区
+    software_ref_buffer_.resize(SOFTWARE_REF_BUFFER_SIZE, 0);
+    software_ref_write_pos_ = 0;
+    software_ref_read_pos_ = 0;
+    ESP_LOGI(TAG, "Software reference buffer initialized, size: %d samples", SOFTWARE_REF_BUFFER_SIZE);
+#endif
 
     esp_opus_dec_cfg_t opus_dec_cfg = OPUS_DEC_CFG(codec->output_sample_rate(), OPUS_FRAME_DURATION_MS);
     auto ret = esp_opus_dec_open(&opus_dec_cfg, sizeof(esp_opus_dec_cfg_t), &opus_decoder_);
@@ -188,25 +201,34 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
         codec_->EnableInput(true);
     }
 
+#ifdef CONFIG_USE_DEVICE_AEC
+    // 软件 AEC 模式：硬件只有单声道麦克风，参考信号由软件提供
+    // 需要特殊处理通道数：先读取单声道，然后交织成双声道
+    const bool software_aec_mode = codec_->input_reference();
+    const int hardware_channels = software_aec_mode ? 1 : codec_->input_channels();
+#else
+    const int hardware_channels = codec_->input_channels();
+#endif
+
     if (codec_->input_sample_rate() != sample_rate) {
-        data.resize(samples * codec_->input_sample_rate() / sample_rate * codec_->input_channels());
+        data.resize(samples * codec_->input_sample_rate() / sample_rate * hardware_channels);
         if (!codec_->InputData(data)) {
             return false;
         }
         if (input_resampler_ != nullptr) {
             std::lock_guard<std::mutex> lock(input_resampler_mutex_);
-            uint32_t in_sample_num = data.size() / codec_->input_channels();
+            uint32_t in_sample_num = data.size() / hardware_channels;
             uint32_t output_samples = 0;
             esp_ae_rate_cvt_get_max_out_sample_num(input_resampler_, in_sample_num, &output_samples);
-            auto resampled = std::vector<int16_t>(output_samples * codec_->input_channels());
+            auto resampled = std::vector<int16_t>(output_samples * hardware_channels);
             uint32_t actual_output = output_samples;
             esp_ae_rate_cvt_process(input_resampler_, (esp_ae_sample_t)data.data(), in_sample_num,
                                    (esp_ae_sample_t)resampled.data(), &actual_output);
-            resampled.resize(actual_output * codec_->input_channels());
+            resampled.resize(actual_output * hardware_channels);
             data = std::move(resampled);
         }
     } else {
-        data.resize(samples * codec_->input_channels());
+        data.resize(samples * hardware_channels);
         if (!codec_->InputData(data)) {
             return false;
         }
@@ -215,6 +237,13 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
     /* Update the last input time */
     last_input_time_ = std::chrono::steady_clock::now();
     debug_statistics_.input_count++;
+
+#ifdef CONFIG_USE_DEVICE_AEC
+    // 软件回采：将麦克风数据与参考信号交织成双声道
+    if (software_aec_mode) {
+        InterleaveWithReference(data);
+    }
+#endif
 
 #if CONFIG_USE_AUDIO_DEBUGGER
     // 音频调试：发送原始音频数据
@@ -314,6 +343,14 @@ void AudioService::AudioOutputTask() {
             esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
             codec_->EnableOutput(true);
         }
+
+#ifdef CONFIG_USE_DEVICE_AEC
+        // 软件回采：将输出数据写入参考缓冲区，供 AEC 使用
+        // 注意：task->pcm 的采样率是 codec_->output_sample_rate()
+        // WriteSoftwareReference 内部会自动重采样到 16kHz（AFE AEC 要求）
+        WriteSoftwareReference(task->pcm, codec_->output_sample_rate());
+#endif
+
         codec_->OutputData(task->pcm);
 
         /* Update the last output time */
@@ -804,3 +841,237 @@ bool AudioService::IsAfeWakeWord() {
     return false;
 #endif
 }
+
+#ifdef CONFIG_USE_DEVICE_AEC
+
+// 软件回采参数
+static constexpr int kSoftwareRefSampleRate = 16000;    // AFE AEC 要求的采样率
+// 增加延迟补偿，确保缓冲区里有足够的数据
+// 60ms * 16 samples/ms = 960 samples
+// 延迟补偿：软件回采的延迟主要是 I2S 缓冲，通常 10-20ms
+// 设置为 16ms（约 1 帧），让 AEC 有足够的参考数据
+static constexpr size_t kDelayCompensationMs = 16;      
+static constexpr size_t kDelayCompensationSamples = kSoftwareRefSampleRate * kDelayCompensationMs / 1000;
+
+void AudioService::WriteSoftwareReference(const std::vector<int16_t>& data, int sample_rate) {
+    if (data.empty()) {
+        ESP_LOGD(TAG, "WriteSoftwareReference: empty data, skipping");
+        return;
+    }
+
+    // 调试日志：追踪写入情况
+    static uint32_t write_count = 0;
+    write_count++;
+    if (write_count % 50 == 1) {  // 每 50 次打印一次
+        ESP_LOGI(TAG, "WriteSoftwareReference: count=%lu, samples=%d, rate=%d", 
+                 write_count, (int)data.size(), sample_rate);
+    }
+
+    const int16_t* src_data = data.data();
+    size_t src_samples = data.size();
+    std::vector<int16_t> resampled_data;
+
+    // 【隐患1修复】采样率不匹配 - 必须重采样到 16kHz
+    if (sample_rate != kSoftwareRefSampleRate) {
+        std::lock_guard<std::mutex> resampler_lock(software_ref_resampler_mutex_);
+        
+        // 检查是否需要重新创建重采样器
+        if (software_ref_resampler_ == nullptr || software_ref_resampler_src_rate_ != sample_rate) {
+            if (software_ref_resampler_ != nullptr) {
+                esp_ae_rate_cvt_close(software_ref_resampler_);
+                software_ref_resampler_ = nullptr;
+            }
+            
+            esp_ae_rate_cvt_cfg_t cfg = {
+                .src_rate = (uint32_t)sample_rate,
+                .dest_rate = (uint32_t)kSoftwareRefSampleRate,
+                .channel = 1,
+                .bits_per_sample = ESP_AUDIO_BIT16,
+                .complexity = 2,
+                .perf_type = ESP_AE_RATE_CVT_PERF_TYPE_SPEED,
+            };
+            
+            auto ret = esp_ae_rate_cvt_open(&cfg, &software_ref_resampler_);
+            if (ret != ESP_OK || software_ref_resampler_ == nullptr) {
+                ESP_LOGE(TAG, "Failed to create software ref resampler: %d -> 16000, error: %d", 
+                         sample_rate, ret);
+                return;
+            }
+            software_ref_resampler_src_rate_ = sample_rate;
+            ESP_LOGI(TAG, "Software ref resampler created: %d -> 16000 Hz", sample_rate);
+        }
+        
+        // 执行重采样
+        uint32_t output_samples = 0;
+        esp_ae_rate_cvt_get_max_out_sample_num(software_ref_resampler_, src_samples, &output_samples);
+        resampled_data.resize(output_samples);
+        
+        uint32_t actual_output = output_samples;
+        esp_ae_rate_cvt_process(software_ref_resampler_, 
+                                (esp_ae_sample_t)data.data(), src_samples,
+                                (esp_ae_sample_t)resampled_data.data(), &actual_output);
+        resampled_data.resize(actual_output);
+        
+        src_data = resampled_data.data();
+        src_samples = resampled_data.size();
+        
+        ESP_LOGD(TAG, "Ref resampled: %d@%dHz -> %d@16kHz", 
+                 (int)data.size(), sample_rate, (int)src_samples);
+    }
+
+    // 【隐患4修复】音量失配 - 对参考信号应用音量缩放
+    // 必须与 NoAudioCodec::Write 中的逻辑一致
+    std::vector<int16_t> scaled_buffer;
+    const int16_t* write_data = src_data;
+    
+    int volume = codec_->output_volume();
+    if (volume != 100) {  // 如果音量不是 100%，进行缩放
+        // NoAudioCodec 逻辑: volume_factor = pow(vol/100.0, 2) * 65536
+        int32_t volume_factor = (int32_t)(double(volume) * double(volume) / 10000.0 * 65536.0);
+        
+        scaled_buffer.resize(src_samples);
+        for (size_t i = 0; i < src_samples; i++) {
+            int64_t temp = int64_t(src_data[i]) * volume_factor;
+            // 还原到 16bit 范围 (int32_t / 65536)
+            int32_t val = static_cast<int32_t>(temp >> 16);
+            
+            // 饱和处理
+            if (val > INT16_MAX) val = INT16_MAX;
+            else if (val < INT16_MIN) val = INT16_MIN;
+            
+            scaled_buffer[i] = (int16_t)val;
+        }
+        write_data = scaled_buffer.data();
+    }
+
+    // 【隐患2修复】环形缓冲区写入 - 加锁保护
+    std::lock_guard<std::mutex> lock(software_ref_mutex_);
+    
+    // 检查是否会发生溢出（写指针追上读指针）
+    size_t available_space;
+    if (software_ref_write_pos_ >= software_ref_read_pos_) {
+        available_space = SOFTWARE_REF_BUFFER_SIZE - (software_ref_write_pos_ - software_ref_read_pos_) - 1;
+    } else {
+        available_space = software_ref_read_pos_ - software_ref_write_pos_ - 1;
+    }
+    
+    if (src_samples > available_space) {
+        // 溢出：丢弃旧数据，移动读指针
+        size_t overflow = src_samples - available_space;
+        software_ref_read_pos_ = (software_ref_read_pos_ + overflow) % SOFTWARE_REF_BUFFER_SIZE;
+        software_ref_overrun_count_++;
+        
+        if (software_ref_overrun_count_ % 100 == 1) {
+            ESP_LOGW(TAG, "Software ref buffer overrun! count=%lu, overflow=%d samples", 
+                     software_ref_overrun_count_, (int)overflow);
+        }
+    }
+    
+    // 写入数据到环形缓冲区
+    for (size_t i = 0; i < src_samples; i++) {
+        software_ref_buffer_[software_ref_write_pos_] = write_data[i];
+        software_ref_write_pos_ = (software_ref_write_pos_ + 1) % SOFTWARE_REF_BUFFER_SIZE;
+    }
+    
+    // 写入后计算当前可用数据量（调试用）
+    size_t current_available;
+    if (software_ref_write_pos_ >= software_ref_read_pos_) {
+        current_available = software_ref_write_pos_ - software_ref_read_pos_;
+    } else {
+        current_available = SOFTWARE_REF_BUFFER_SIZE - software_ref_read_pos_ + software_ref_write_pos_;
+    }
+    
+    static uint32_t log_counter = 0;
+    log_counter++;
+    if (log_counter % 50 == 1) {
+        ESP_LOGI(TAG, "SoftRef write: +%d samples, available=%d", (int)src_samples, (int)current_available);
+    }
+}
+
+void AudioService::ReadSoftwareReference(std::vector<int16_t>& ref_data, size_t samples) {
+    std::lock_guard<std::mutex> lock(software_ref_mutex_);
+    
+    ref_data.resize(samples);
+    
+    // 计算缓冲区中可用的数据量
+    size_t available;
+    if (software_ref_write_pos_ >= software_ref_read_pos_) {
+        available = software_ref_write_pos_ - software_ref_read_pos_;
+    } else {
+        available = SOFTWARE_REF_BUFFER_SIZE - software_ref_read_pos_ + software_ref_write_pos_;
+    }
+    
+    // 【隐患3修复】添加调试日志，用于观察缓冲区健康状况
+    ESP_LOGD(TAG, "SoftRef: available=%d, need=%d+%d, write_pos=%d, read_pos=%d", 
+             (int)available, (int)samples, (int)kDelayCompensationSamples,
+             (int)software_ref_write_pos_, (int)software_ref_read_pos_);
+    
+    // 检查是否有足够的数据（包括延迟补偿）
+    size_t required = samples + kDelayCompensationSamples;
+    
+    if (available < required) {
+        // 欠载：数据不足
+        software_ref_underrun_count_++;
+        
+        if (software_ref_underrun_count_ % 100 == 1) {
+            ESP_LOGW(TAG, "Software ref buffer underrun! count=%lu, available=%d, required=%d", 
+                     software_ref_underrun_count_, (int)available, (int)required);
+        }
+        
+        // 欠载策略：
+        // 返回静音，但【不推进读指针】！
+        // 
+        // 原因：在 Listening 状态（无播放）时，AFE 持续读取会消耗缓冲区
+        // 如果推进读指针，缓冲区会被读空，导致 AI 开始说话时没有参考数据
+        // 不推进读指针可以保持缓冲区状态，让新数据能正常积累
+        //
+        // 当 AI 开始说话（有播放）时：
+        // 1. 新数据被写入缓冲区
+        // 2. available 逐渐增加
+        // 3. 当 available >= required 时，恢复正常读取
+        
+        std::fill(ref_data.begin(), ref_data.end(), 0);
+        // 不推进读指针！
+        return;
+    }
+    
+    // 正常读取：从延迟补偿后的位置开始读取
+    // 这样读取的数据在时间上与当前麦克风采集的数据对应
+    size_t read_pos = (software_ref_read_pos_ + kDelayCompensationSamples) % SOFTWARE_REF_BUFFER_SIZE;
+    
+    for (size_t i = 0; i < samples; i++) {
+        ref_data[i] = software_ref_buffer_[read_pos];
+        read_pos = (read_pos + 1) % SOFTWARE_REF_BUFFER_SIZE;
+    }
+    
+    // 更新读取位置
+    software_ref_read_pos_ = (software_ref_read_pos_ + samples) % SOFTWARE_REF_BUFFER_SIZE;
+}
+
+void AudioService::InterleaveWithReference(std::vector<int16_t>& mic_data) {
+    // mic_data 当前是单声道麦克风数据
+    // 需要将其与参考信号交织成双声道数据：[Mic, Ref, Mic, Ref, ...]
+    // AFE 的 input_format 为 "MR"，期望这种交织格式
+    
+    size_t samples = mic_data.size();
+    
+    if (samples == 0) {
+        return;
+    }
+    
+    // 读取参考信号
+    std::vector<int16_t> ref_data;
+    ReadSoftwareReference(ref_data, samples);
+    
+    // 创建交织后的数据（双通道）
+    std::vector<int16_t> interleaved(samples * 2);
+    
+    for (size_t i = 0; i < samples; i++) {
+        interleaved[i * 2] = mic_data[i];      // 麦克风通道 (M)
+        interleaved[i * 2 + 1] = ref_data[i];  // 参考通道 (R)
+    }
+    
+    // 替换原始数据
+    mic_data = std::move(interleaved);
+}
+#endif
