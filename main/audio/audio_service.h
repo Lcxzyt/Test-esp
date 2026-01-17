@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <chrono>
 #include <mutex>
+#include <atomic>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -114,6 +115,11 @@ public:
     std::unique_ptr<AudioStreamPacket> PopWakeWordPacket();
     const std::string& GetLastWakeWord() const;
     bool IsVoiceDetected() const { return voice_detected_; }
+    bool IsSoftwareRefReady() const;
+    size_t GetSoftwareRefAvailable() const;
+    size_t GetSoftwareRefRequired() const;
+    uint32_t GetLastMicLevel() const;
+    uint32_t GetLastRefLevel() const;
     bool IsIdle();
     bool IsWakeWordRunning() const { return xEventGroupGetBits(event_group_) & AS_EVENT_WAKE_WORD_RUNNING; }
     bool IsAudioProcessorRunning() const { return xEventGroupGetBits(event_group_) & AS_EVENT_AUDIO_PROCESSOR_RUNNING; }
@@ -201,6 +207,11 @@ private:
     // 调试统计
     uint32_t software_ref_underrun_count_ = 0;  // 欠载次数
     uint32_t software_ref_overrun_count_ = 0;   // 溢出次数
+    std::atomic<size_t> softref_last_available_{0};
+    std::atomic<size_t> softref_last_required_{0};
+    std::atomic<bool> softref_last_ready_{false};
+    std::atomic<uint32_t> last_mic_level_{0};
+    std::atomic<uint32_t> last_ref_level_{0};
     
     // 将输出音频写入软件参考缓冲区（会自动重采样到 16kHz）
     void WriteSoftwareReference(const std::vector<int16_t>& data, int sample_rate);

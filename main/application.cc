@@ -11,6 +11,7 @@
 #include "settings.h"
 
 #include <cstring>
+#include <inttypes.h>
 #include <esp_log.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
@@ -246,13 +247,39 @@ void Application::Run() {
                 // 1. AI 说话保护期：给 AEC 时间收敛
                 // 2. 语音持续检测：过滤瞬时回声
                 
-                const int64_t SPEAKING_PROTECTION_MS = 1500;  // AI 说话保护期（1.5秒）
-                const int64_t VOICE_SUSTAIN_MS = 300;         // 语音持续检测（300ms）
+                const int64_t SPEAKING_PROTECTION_MS = 1200;  // AI 说话保护期（1.2秒）
+                const int64_t VOICE_SUSTAIN_MS = 250;         // 语音持续检测（250ms）
                 
                 int64_t now = esp_timer_get_time() / 1000;  // 转换为毫秒
                 int64_t speaking_duration = now - speaking_start_time_;
                 
                 if (audio_service_.IsVoiceDetected()) {
+                    if (!audio_service_.IsSoftwareRefReady()) {
+                        ESP_LOGI(TAG, "Voice ignored: softref not ready (avail=%d, req=%d)", 
+                                 (int)audio_service_.GetSoftwareRefAvailable(),
+                                 (int)audio_service_.GetSoftwareRefRequired());
+                        voice_detected_start_time_ = 0;
+                        continue;
+                    }
+                    const uint32_t mic_level = audio_service_.GetLastMicLevel();
+                    const uint32_t ref_level = audio_service_.GetLastRefLevel();
+                    const uint32_t REF_MIN_LEVEL = 300;  // 过低时用绝对门限判断
+                    const uint32_t MIC_MIN_LEVEL = 400;  // 人声绝对能量门限
+                    const uint32_t MIC_REF_RATIO_NUM = 7; // mic/ref >= 1.75 才认为是人声
+                    const uint32_t MIC_REF_RATIO_DEN = 4;
+                    if (ref_level >= REF_MIN_LEVEL) {
+                        if ((uint64_t)mic_level * MIC_REF_RATIO_DEN < (uint64_t)ref_level * MIC_REF_RATIO_NUM) {
+                            ESP_LOGI(TAG, "Voice ignored: echo-like (mic=%" PRIu32 ", ref=%" PRIu32 ")",
+                                     mic_level, ref_level);
+                            voice_detected_start_time_ = 0;
+                            continue;
+                        }
+                    } else if (mic_level < MIC_MIN_LEVEL) {
+                        ESP_LOGI(TAG, "Voice ignored: mic too low (mic=%" PRIu32 ", ref=%" PRIu32 ")",
+                                 mic_level, ref_level);
+                        voice_detected_start_time_ = 0;
+                        continue;
+                    }
                     // VAD 检测到声音开始
                     if (voice_detected_start_time_ == 0) {
                         // 第一次检测到，记录开始时间
@@ -269,6 +296,25 @@ void Application::Run() {
                                  (int)voice_duration, (int)speaking_duration);
                         
                         // 在声音结束时也检查打断条件（针对用户短暂说话后停顿的情况）
+                        const uint32_t mic_level = audio_service_.GetLastMicLevel();
+                        const uint32_t ref_level = audio_service_.GetLastRefLevel();
+                        const uint32_t REF_MIN_LEVEL = 300;
+                        const uint32_t MIC_MIN_LEVEL = 400;
+                        const uint32_t MIC_REF_RATIO_NUM = 7;
+                        const uint32_t MIC_REF_RATIO_DEN = 4;
+                        if (ref_level >= REF_MIN_LEVEL) {
+                            if ((uint64_t)mic_level * MIC_REF_RATIO_DEN < (uint64_t)ref_level * MIC_REF_RATIO_NUM) {
+                                ESP_LOGI(TAG, "Voice end ignored: echo-like (mic=%" PRIu32 ", ref=%" PRIu32 ")",
+                                         mic_level, ref_level);
+                                voice_detected_start_time_ = 0;
+                                continue;
+                            }
+                        } else if (mic_level < MIC_MIN_LEVEL) {
+                            ESP_LOGI(TAG, "Voice end ignored: mic too low (mic=%" PRIu32 ", ref=%" PRIu32 ")",
+                                     mic_level, ref_level);
+                            voice_detected_start_time_ = 0;
+                            continue;
+                        }
                         if (speaking_duration > SPEAKING_PROTECTION_MS && voice_duration > VOICE_SUSTAIN_MS) {
                             ESP_LOGI(TAG, ">>> Voice interrupt triggered on voice end! (AI: %d ms, Voice: %d ms)", 
                                      (int)speaking_duration, (int)voice_duration);
@@ -311,6 +357,29 @@ void Application::Run() {
                 
                 // 检查是否有持续的声音
                 if (voice_detected_start_time_ > 0 && audio_service_.IsVoiceDetected()) {
+                    if (!audio_service_.IsSoftwareRefReady()) {
+                        ESP_LOGI(TAG, "Voice ignored in tick: softref not ready (avail=%d, req=%d)", 
+                                 (int)audio_service_.GetSoftwareRefAvailable(),
+                                 (int)audio_service_.GetSoftwareRefRequired());
+                        continue;
+                    }
+                    const uint32_t mic_level = audio_service_.GetLastMicLevel();
+                    const uint32_t ref_level = audio_service_.GetLastRefLevel();
+                    const uint32_t REF_MIN_LEVEL = 300;
+                    const uint32_t MIC_MIN_LEVEL = 400;
+                    const uint32_t MIC_REF_RATIO_NUM = 7;
+                    const uint32_t MIC_REF_RATIO_DEN = 4;
+                    if (ref_level >= REF_MIN_LEVEL) {
+                        if ((uint64_t)mic_level * MIC_REF_RATIO_DEN < (uint64_t)ref_level * MIC_REF_RATIO_NUM) {
+                            ESP_LOGI(TAG, "Voice ignored in tick: echo-like (mic=%" PRIu32 ", ref=%" PRIu32 ")",
+                                     mic_level, ref_level);
+                            continue;
+                        }
+                    } else if (mic_level < MIC_MIN_LEVEL) {
+                        ESP_LOGI(TAG, "Voice ignored in tick: mic too low (mic=%" PRIu32 ", ref=%" PRIu32 ")",
+                                 mic_level, ref_level);
+                        continue;
+                    }
                     int64_t voice_duration = now - voice_detected_start_time_;
                     
                     // 两个条件都满足才打断

@@ -1,6 +1,7 @@
 #include "audio_service.h"
 #include <esp_log.h>
 #include <cstring>
+#include <cstdlib>
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)        \
     (esp_ae_rate_cvt_cfg_t)                                  \
@@ -850,7 +851,7 @@ static constexpr int kSoftwareRefSampleRate = 16000;    // AFE AEC 要求的采�
 // 60ms * 16 samples/ms = 960 samples
 // 延迟补偿：软件回采的延迟主要是 I2S 缓冲，通常 10-20ms
 // 设置为 16ms（约 1 帧），让 AEC 有足够的参考数据
-static constexpr size_t kDelayCompensationMs = 16;      
+static constexpr size_t kDelayCompensationMs = 8;
 static constexpr size_t kDelayCompensationSamples = kSoftwareRefSampleRate * kDelayCompensationMs / 1000;
 
 void AudioService::WriteSoftwareReference(const std::vector<int16_t>& data, int sample_rate) {
@@ -1008,6 +1009,9 @@ void AudioService::ReadSoftwareReference(std::vector<int16_t>& ref_data, size_t 
     
     // 检查是否有足够的数据（包括延迟补偿）
     size_t required = samples + kDelayCompensationSamples;
+    softref_last_available_.store(available);
+    softref_last_required_.store(required);
+    softref_last_ready_.store(available >= required);
     
     if (available < required) {
         // 欠载：数据不足
@@ -1062,6 +1066,18 @@ void AudioService::InterleaveWithReference(std::vector<int16_t>& mic_data) {
     // 读取参考信号
     std::vector<int16_t> ref_data;
     ReadSoftwareReference(ref_data, samples);
+
+    // 计算简单能量（平均绝对值），用于区分回声与人声
+    int64_t mic_acc = 0;
+    int64_t ref_acc = 0;
+    for (size_t i = 0; i < samples; i++) {
+        mic_acc += std::abs(mic_data[i]);
+        ref_acc += std::abs(ref_data[i]);
+    }
+    uint32_t mic_level = samples ? (uint32_t)(mic_acc / (int64_t)samples) : 0;
+    uint32_t ref_level = samples ? (uint32_t)(ref_acc / (int64_t)samples) : 0;
+    last_mic_level_.store(mic_level);
+    last_ref_level_.store(ref_level);
     
     // 创建交织后的数据（双通道）
     std::vector<int16_t> interleaved(samples * 2);
@@ -1075,3 +1091,35 @@ void AudioService::InterleaveWithReference(std::vector<int16_t>& mic_data) {
     mic_data = std::move(interleaved);
 }
 #endif
+
+bool AudioService::IsSoftwareRefReady() const {
+#ifdef CONFIG_USE_DEVICE_AEC
+    return softref_last_ready_.load();
+#else
+    return false;
+#endif
+}
+
+size_t AudioService::GetSoftwareRefAvailable() const {
+#ifdef CONFIG_USE_DEVICE_AEC
+    return softref_last_available_.load();
+#else
+    return 0;
+#endif
+}
+
+size_t AudioService::GetSoftwareRefRequired() const {
+#ifdef CONFIG_USE_DEVICE_AEC
+    return softref_last_required_.load();
+#else
+    return 0;
+#endif
+}
+
+uint32_t AudioService::GetLastMicLevel() const {
+    return last_mic_level_.load();
+}
+
+uint32_t AudioService::GetLastRefLevel() const {
+    return last_ref_level_.load();
+}
